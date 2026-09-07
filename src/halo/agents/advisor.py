@@ -18,7 +18,7 @@ import re
 from pydantic import BaseModel, Field
 
 from halo.domain.quote import Citation, CitationKind
-from halo.platform.bedrock import ModelClient
+from halo.platform.bedrock import ModelClient, Truncated
 from halo.platform.budget import BudgetExceeded, BudgetTracker
 from halo.platform.envelope import EVIDENCE_RULE, Evidence, wrap_all
 from halo.platform.guardrails import Guardrail, Surface
@@ -168,6 +168,17 @@ def answer_policy_question(
             system=SYSTEM_PROMPT.format(evidence_rule=EVIDENCE_RULE),
             user=_prompt(question, retrieved),
             output_format=PolicyAnswer,
+        )
+    except Truncated as exc:
+        return (
+            Outcome(
+                status=OutcomeStatus.ESCALATED,
+                agent=AGENT_NAME,
+                escalation_reason=f"the answer was cut off before it was finished: {exc}",
+                next_state="await_budget_increase",
+                usage=tracker.usage,
+            ),
+            retrieved,
         )
     except BudgetExceeded as exc:
         return (

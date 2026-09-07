@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 from halo.agents.provenance import FigureCheck, verify_figures
 from halo.platform import telemetry
-from halo.platform.bedrock import ModelClient
+from halo.platform.bedrock import ModelClient, Truncated
 from halo.platform.budget import Budget, BudgetExceeded, BudgetTracker
 from halo.platform.envelope import EVIDENCE_RULE, Evidence, wrap
 from halo.platform.gateway import ToolCall, ToolGateway
@@ -125,6 +125,23 @@ async def run_specialist(
                     telemetry.record_usage(model_span, tracker.usage)
                 messages.append({"role": "assistant", "content": turn.content})
 
+                if turn.stop_reason == "max_tokens":
+                    # The service enforced the output ceiling and the model was
+                    # never told about it, so this turn stops mid-token. Treated
+                    # as an end_turn it would be indistinguishable from a
+                    # specialist that had finished speaking, and the truncation
+                    # would travel on into the report as though it were an
+                    # answer. The partial content stays in `messages` for the
+                    # trace and goes no further.
+                    return finish(
+                        OutcomeStatus.ESCALATED,
+                        escalation_reason=(
+                            f"{specialist.name} was cut off at its output ceiling mid-turn, "
+                            "so the work it was describing is incomplete"
+                        ),
+                        next_state="await_budget_increase",
+                    )
+
                 if turn.stop_reason != "tool_use":
                     break
 
@@ -194,6 +211,16 @@ async def run_specialist(
                 )
                 _charge(tracker, result)
                 telemetry.record_usage(model_span, tracker.usage)
+        except Truncated as exc:
+            # Distinct from the breach below on purpose. Running out of money is
+            # fixed by raising a limit; an answer that outgrew its ceiling is
+            # not, and an escalation that names the wrong one sends someone to
+            # change a number that was never reached.
+            return finish(
+                OutcomeStatus.ESCALATED,
+                escalation_reason=f"{specialist.name} could not finish its report: {exc}",
+                next_state="await_budget_increase",
+            )
         except BudgetExceeded as exc:
             # The done-when for M6. The reason names the dimension and no partial
             # answer travels with it: a truncated report reads like a complete one

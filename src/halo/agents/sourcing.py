@@ -27,7 +27,7 @@ from halo.agents.provenance import FigureCheck, SourcedFigure, verify_figures
 from halo.domain.catalog import DecorationMethod
 from halo.domain.quote import Citation, CitationKind, DecorationCharge, Quote, QuoteLine
 from halo.domain.request import QuoteRequest
-from halo.platform.bedrock import ModelClient
+from halo.platform.bedrock import ModelClient, Truncated
 from halo.platform.budget import BudgetExceeded, BudgetTracker
 from halo.platform.envelope import EVIDENCE_RULE, Evidence, wrap
 from halo.platform.gateway import ToolCall, ToolGateway
@@ -357,6 +357,22 @@ async def source_quote(
             turn = client.converse(system=system, messages=messages, tools=TOOLS)
             messages.append({"role": "assistant", "content": turn.content})
 
+            if turn.stop_reason == "max_tokens":
+                # Cut off at the output ceiling, not finished. Falling through
+                # would nudge it for the tools it still owes, on top of a turn
+                # that stopped mid-token — spending more budget to extend an
+                # answer that was already truncated once.
+                return Outcome(
+                    status=OutcomeStatus.ESCALATED,
+                    agent=AGENT_NAME,
+                    escalation_reason=(
+                        "sourcing was cut off at its output ceiling mid-turn, so the work "
+                        "it was describing is incomplete"
+                    ),
+                    next_state="await_budget_increase",
+                    usage=tracker.usage,
+                )
+
             if turn.stop_reason != "tool_use":
                 missing = REQUIRED_TOOLS - {c.name for c in gateway.audit if c.ok}
                 if not missing or nudges >= MAX_NUDGES:
@@ -429,6 +445,14 @@ async def source_quote(
             system="Report the sourcing you just completed, with a tool_call_id per figure.",
             user=_transcript(messages),
             output_format=SourcingDecision,
+        )
+    except Truncated as exc:
+        return Outcome(
+            status=OutcomeStatus.ESCALATED,
+            agent=AGENT_NAME,
+            escalation_reason=f"the sourcing report could not be finished: {exc}",
+            next_state="await_budget_increase",
+            usage=tracker.usage,
         )
     except BudgetExceeded as exc:
         return Outcome(

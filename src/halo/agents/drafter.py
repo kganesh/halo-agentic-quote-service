@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import date
 
 from halo.domain.request import UngroundedDraft
-from halo.platform.bedrock import ModelClient
+from halo.platform.bedrock import ModelClient, Truncated
 from halo.platform.budget import BudgetExceeded, BudgetTracker
 from halo.platform.identity import Principal
 from halo.platform.outcome import Outcome, OutcomeStatus
@@ -70,6 +70,14 @@ def draft_quote(
             system=SYSTEM_PROMPT.format(today=today or date.today()),
             user=request_text,
             output_format=UngroundedDraft,
+        )
+    except Truncated as exc:
+        return Outcome(
+            status=OutcomeStatus.ESCALATED,
+            agent=AGENT_NAME,
+            escalation_reason=f"the draft was cut off before it was finished: {exc}",
+            next_state="await_budget_increase",
+            usage=tracker.usage,
         )
     except BudgetExceeded as exc:
         return Outcome(

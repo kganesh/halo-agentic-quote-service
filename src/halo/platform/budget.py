@@ -93,6 +93,28 @@ class BudgetTracker:
     def elapsed_seconds(self) -> float:
         return self._now() - self._started
 
+    @property
+    def remaining_seconds(self) -> float:
+        """Wall clock left before this budget trips. Never negative.
+
+        This is what a caller passes as a request timeout, so that a call which
+        would outlast the budget is cut off by the HTTP layer instead of running
+        to completion and being noticed afterwards. Zero means the budget is
+        already spent; `check` is what turns that into a `BudgetExceeded`.
+        """
+        return max(0.0, self._budget.wall_clock_seconds - self.elapsed_seconds)
+
+    @property
+    def remaining_usd(self) -> Decimal:
+        """Dollars left before this budget trips. Never negative.
+
+        `check` runs between steps, so it can only catch an overspend after the
+        call that caused it has been paid for. This is the number that lets a
+        caller size the next call to fit, which is the only way a per-call
+        overshoot is prevented rather than reported.
+        """
+        return max(Decimal("0.00"), self._budget.max_usd - self.usage.usd)
+
     def check(self) -> None:
         """Raise if any limit has been passed. Call this before each step."""
         if self.elapsed_seconds > self._budget.wall_clock_seconds:
@@ -112,6 +134,24 @@ class BudgetTracker:
             )
         if self.usage.usd > self._budget.max_usd:
             raise BudgetExceeded("max_usd", self._budget.max_usd, self.usage.usd, self._owner)
+
+    def exceeded(self, dimension: str, spent: object) -> BudgetExceeded:
+        """The breach for a limit the caller detected on its own.
+
+        `check` covers what the tracker can see by itself. Two things it cannot:
+        sizing a call to the remaining dollars needs a rate card, and a request
+        cut off in flight is known to the HTTP layer. Both are found outside,
+        and both are the same kind of failure — so they are raised as the same
+        exception, carrying this tracker's owner and limit rather than a second
+        error type the loop would have to learn.
+        """
+        limits: dict[str, object] = {
+            "wall_clock_seconds": self._budget.wall_clock_seconds,
+            "max_tokens": self._budget.max_tokens,
+            "max_tool_calls": self._budget.max_tool_calls,
+            "max_usd": self._budget.max_usd,
+        }
+        return BudgetExceeded(dimension, limits[dimension], spent, self._owner)
 
     def record_model_call(
         self,

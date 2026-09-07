@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 from pydantic import BaseModel
 
@@ -83,6 +83,14 @@ Caching only pays off if the prefix is read back. One write plus one read costs
 CACHE_WRITE_1H_MULTIPLIER = Decimal("2.00")
 """The 1-hour cache costs twice a fresh input token to write."""
 
+MIN_OUTPUT_TOKENS = 256
+"""The smallest output cap worth paying for.
+
+A call sized to the remaining budget can be clamped so low that it produces a
+report truncated mid-sentence — which costs money and yields nothing usable.
+Below this the run stops on the dollar budget instead, which is what it is
+actually short of."""
+
 
 class UnpricedModel(RuntimeError):
     """This model has no entry in the rate card, so its spend cannot be counted.
@@ -109,6 +117,31 @@ class UnpricedModel(RuntimeError):
             "`aws bedrock list-foundation-model-agreement-offers` for your account."
         )
         self.model = model
+
+
+class Truncated(RuntimeError):
+    """The model hit its output ceiling before finishing a structured answer.
+
+    `max_tokens` is enforced by the service, and the model is not told about it:
+    generation stops mid-token and the call returns 200 with whatever was
+    produced. For a tool-use turn that partial content is still worth a decision,
+    so `converse` hands it back and the loop decides. For a report there is
+    nothing to decide — `parsed_output` comes back `None`, and half a structured
+    answer is not an answer — so this is raised instead, and `ModelResult.parsed`
+    keeps its promise of holding a complete one.
+
+    Kept separate from `BudgetExceeded` because the fix differs. A clamped
+    ceiling means the run is short of money; the default ceiling means the report
+    is longer than the ceiling allows, and raising `max_usd` would change
+    nothing.
+    """
+
+    def __init__(self, model: str, max_tokens: int) -> None:
+        super().__init__(
+            f"{model} stopped at its {max_tokens:,}-token output ceiling with the "
+            "answer unfinished, so no complete report was produced"
+        )
+        self.max_tokens = max_tokens
 
 
 def is_priced(model: str) -> bool:
@@ -222,6 +255,50 @@ def estimate_usd(
         + Decimal(cache_write_1h_tokens) * price_in * CACHE_WRITE_1H_MULTIPLIER
     ) / million
     return cost.quantize(Decimal("0.000001"))
+
+
+def affordable_output_tokens(model: str, remaining_usd: Decimal) -> int:
+    """How many output tokens `remaining_usd` still buys on this model.
+
+    Output is the only part of a call's cost the caller controls once the
+    messages are built, so this is what `max_tokens` gets clamped to. Sizing the
+    call to the budget is the only thing that stops a single turn from passing
+    `max_usd`: the loop checks between steps, and a non-streaming request cannot
+    be stopped part-way, so without this the overshoot is already paid for by
+    the time anything notices.
+
+    The rate is read for a thousand tokens rather than one. `estimate_usd`
+    quantizes to six decimal places, which at single-token granularity rounds a
+    cheap model's output rate by a few percent.
+
+    An unpriced model returns zero, matching `estimate_usd`. That cannot reach a
+    real run — `BedrockClient` refuses to be constructed for one — and a caller
+    that clamps to zero would raise `UnpricedModel`'s problem as a confusing
+    `max_tokens` error instead.
+    """
+    per_1k = estimate_usd(model, 0, 1000)
+    if per_1k <= 0 or remaining_usd <= 0:
+        return 0
+    return int(remaining_usd * 1000 / per_1k)
+
+
+def input_usd_for(model: str, counts: TokenCounts) -> Decimal:
+    """What the input half of a call cost, at the cache rates it actually paid.
+
+    Read back from a completed call so the next one can reserve room for its own
+    input. Counting the tokens ahead of time instead would mean a
+    `count_tokens` round trip per turn, and that endpoint cannot see what the
+    cache will serve — against a deliberately cached system prefix it would
+    price reads at ten times what they cost and stop runs that had budget left.
+    """
+    return estimate_usd(
+        model,
+        counts.input_tokens,
+        0,
+        cache_read_tokens=counts.cache_read_tokens,
+        cache_write_5m_tokens=counts.cache_write_5m_tokens,
+        cache_write_1h_tokens=counts.cache_write_1h_tokens,
+    )
 
 
 def estimate_usd_for(model: str, counts: TokenCounts) -> Decimal:
@@ -341,7 +418,7 @@ class BedrockClient:
         model: str = DEFAULT_MODEL,
         tracker: BudgetTracker | None = None,
     ) -> None:
-        from anthropic import AnthropicBedrock, AnthropicBedrockMantle
+        from anthropic import AnthropicBedrock, AnthropicBedrockMantle, APITimeoutError
 
         # Before anything else. A model with no rate card entry makes every
         # dollar budget in the process unenforceable, and the failure is silent
@@ -363,6 +440,73 @@ class BedrockClient:
         self.model = model
         self.region = region
         self._tracker = tracker
+        self._last_input_usd = Decimal("0.00")
+        # Held rather than imported at module scope so the SDK stays behind the
+        # same lazy import as the clients above.
+        self._timeout_error = APITimeoutError
+
+    def _prepared(self, max_tokens: int) -> tuple[Any, int]:
+        """The client and output cap to use for one call, against the budget.
+
+        Three things happen here, and only the first is what `check` alone did:
+
+        1. The budget is checked, so a run already over its limit never calls.
+        2. `max_tokens` is clamped to what the remaining dollars buy. A
+           non-streaming request cannot be stopped part-way, so a call that
+           starts is paid for in full; sizing it to fit is what keeps a single
+           turn from passing `max_usd` and being noticed only afterwards.
+        3. The request gets the remaining wall clock as its timeout, so a call
+           that would outlast the budget is cut off in flight.
+
+        `max_retries=0` is not a preference. The SDK retries timeouts, so at the
+        default of 2 a call given the remaining wall clock could take three
+        times it — a budget quietly worth triple what it says.
+        """
+        if self._tracker is None:
+            return self._client, max_tokens
+
+        self._tracker.check()
+        # Output is not the whole bill. The transcript and its tool results are
+        # resent every turn, and on a long loop that input outgrows the answer.
+        # Sizing the output cap against the *whole* remainder would authorize a
+        # call whose input alone could pass the limit, so the last call's input
+        # is held back first.
+        spendable = self._tracker.remaining_usd - self._last_input_usd
+        affordable = affordable_output_tokens(self.model, spendable)
+        if affordable < MIN_OUTPUT_TOKENS:
+            # Enough budget left to pass `check`, not enough to buy an answer
+            # worth having. Stopping here produces the same clean escalation as
+            # any other breach, instead of a deliberately truncated report that
+            # reads like a complete one.
+            raise self._tracker.exceeded(
+                "max_usd",
+                f"{self._tracker.usage.usd}, which after reserving {self._last_input_usd} for "
+                f"input leaves room for only {affordable} output tokens",
+            )
+
+        client = self._client.with_options(
+            timeout=self._tracker.remaining_seconds,
+            max_retries=0,
+        )
+        return client, min(max_tokens, affordable)
+
+    def _cut_off(self, exc: Exception) -> NoReturn:
+        """Re-raise a timed-out request as whatever actually ended it.
+
+        When a tracker set the timeout, the timeout *is* the budget, so the
+        breach is reported as the budget dimension that set it. Leaking
+        `APITimeoutError` upward would make the loop import the SDK to catch it,
+        and would report an infrastructure fault for a limit doing its job.
+
+        An untracked client has no such timeout — what it hit is the SDK's own
+        ten-minute default, which is a real fault and is left alone.
+        """
+        if self._tracker is None:
+            raise exc
+        raise self._tracker.exceeded(
+            "wall_clock_seconds",
+            f"{self._tracker.elapsed_seconds:.2f} when the request was cut off in flight",
+        ) from exc
 
     def parse[T: BaseModel](
         self,
@@ -372,20 +516,28 @@ class BedrockClient:
         output_format: type[T],
         max_tokens: int = 16_000,
     ) -> ModelResult[T]:
-        if self._tracker is not None:
-            self._tracker.check()
+        client, max_tokens = self._prepared(max_tokens)
 
-        response = self._client.messages.parse(
-            model=self.model,
-            max_tokens=max_tokens,
-            system=system_blocks(system),
-            messages=[{"role": "user", "content": user}],
-            output_format=output_format,
-            thinking={"type": "adaptive"},
-        )
+        try:
+            response = client.messages.parse(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system_blocks(system),
+                messages=[{"role": "user", "content": user}],
+                output_format=output_format,
+                thinking={"type": "adaptive"},
+            )
+        except self._timeout_error as exc:
+            self._cut_off(exc)
 
         counts = counts_from(response.usage)
         usd = estimate_usd_for(self.model, counts)
+        # What this call's input cost is the estimate for the next one's. Within
+        # a loop the transcript only grows, so this is a floor rather than a
+        # guarantee — it does not yet include the turn just appended or the tool
+        # results still to come. It turns an unbounded overshoot into a bounded
+        # one, which is the part that was missing.
+        self._last_input_usd = input_usd_for(self.model, counts)
         if self._tracker is not None:
             self._tracker.record_model_call(
                 counts.input_tokens,
@@ -394,6 +546,12 @@ class BedrockClient:
                 cache_read_tokens=counts.cache_read_tokens,
                 cache_write_tokens=counts.cache_write_tokens,
             )
+
+        if response.stop_reason == "max_tokens" or response.parsed_output is None:
+            # Charged above before raising: the tokens were generated and billed
+            # whether or not they added up to an answer. Dropping the cost here
+            # would let a run retry its way past a budget it had already spent.
+            raise Truncated(self.model, max_tokens)
 
         return ModelResult(
             parsed=response.parsed_output,
@@ -420,20 +578,28 @@ class BedrockClient:
         loop is where budgets are checked and tool results are audited. Putting
         the loop here would move both of those outside the agent's control.
         """
-        if self._tracker is not None:
-            self._tracker.check()
+        client, max_tokens = self._prepared(max_tokens)
 
-        response = self._client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            system=system_blocks(system),
-            messages=messages,
-            tools=tools,
-            thinking={"type": "adaptive"},
-        )
+        try:
+            response = client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system_blocks(system),
+                messages=messages,
+                tools=tools,
+                thinking={"type": "adaptive"},
+            )
+        except self._timeout_error as exc:
+            self._cut_off(exc)
 
         counts = counts_from(response.usage)
         usd = estimate_usd_for(self.model, counts)
+        # What this call's input cost is the estimate for the next one's. Within
+        # a loop the transcript only grows, so this is a floor rather than a
+        # guarantee — it does not yet include the turn just appended or the tool
+        # results still to come. It turns an unbounded overshoot into a bounded
+        # one, which is the part that was missing.
+        self._last_input_usd = input_usd_for(self.model, counts)
         if self._tracker is not None:
             self._tracker.record_model_call(
                 counts.input_tokens,
